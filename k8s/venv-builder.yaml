@@ -14,10 +14,18 @@ spec:
       labels:
         app: venv-builder
     spec:
+      # Lets RWO/RWX volumes be group-writable for UID 1000 (matches Dockerfile USER).
+      securityContext:
+        fsGroup: 1000
       containers:
       - name: builder
         image: venv-builder:latest
         imagePullPolicy: Never
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
         ports:
         - containerPort: 8001
         resources:

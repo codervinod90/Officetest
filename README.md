@@ -167,6 +167,7 @@ pytest tests/e2e -v
 | `ModuleNotFoundError` (e.g. `httpx`) | `requirements.txt` present and non-empty for OpenAI agents; **venv-builder** `/build` vs cached venv; use **Rebuild venv**; worker image includes fallback deps for system Python in recent versions |
 | MCP tools missing | **tools-cache** and **mcp-server** init; restart **mcp-server** |
 | LLM errors in Generate | Secret **`llm-api-keys`** mounted on **agent-app**; correct `LLM_PROVIDER` and keys |
+| **venv-builder** HTTP **500** on `/build`, logs show **Permission denied** (pip/venv) | Common on **EFS/NFS** or **root-squash** storage. The manifest runs the builder as **UID 1000** with **`fsGroup: 1000`** so `/venvs` is writable. Rebuild the **venv-builder** image and restart the deployment. If an old PVC was populated as **root**, delete that agent’s folder under `/venvs` on the volume or recreate the **`venv-cache`** PVC once. |
 
 ---
 
@@ -181,9 +182,3 @@ pytest tests/e2e -v
 ## License / security
 
 Treat API keys and cluster Secrets as confidential. Rotate any keys that were ever committed to version control.
-
-  LLM_PROVIDER: "azure"
-  AZURE_OPENAI_ENDPOINT:
-  AZURE_OPENAI_API_KEY: ""
-  AZURE_OPENAI_DEPLOYMENT: 
-  OPENAI_API_KEY: ""
