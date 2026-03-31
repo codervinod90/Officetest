@@ -1,0 +1,14 @@
+{
+  "name": "message_echo",
+  "description": "Returns the input message unchanged (simple shared tool for any agent).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "msg": {
+        "type": "string",
+        "description": "Message to echo back"
+      }
+    },
+    "required": ["msg"]
+  }
+}

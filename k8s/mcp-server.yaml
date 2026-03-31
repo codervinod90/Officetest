@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server
+  labels:
+    app: mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-server
+  template:
+    metadata:
+      labels:
+        app: mcp-server
+    spec:
+      initContainers:
+      - name: seed-tools
+        image: mcp-server:latest
+        imagePullPolicy: Never
+        command: ["sh", "-c"]
+        args:
+        - |
+          set -e
+          mkdir -p /tools
+          for src in /app/artifacts/tools/*/; do
+            [ -d "$src" ] || continue
+            name=$(basename "$src")
+            mkdir -p "/tools/$name"
+            cp -rf "${src}/." "/tools/$name/"
+          done
+        volumeMounts:
+        - name: tools-vol
+          mountPath: /tools
+      containers:
+      - name: mcp
+        image: mcp-server:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8002
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+        env:
+        - name: TOOLS_DIR
+          value: "/tools"
+        - name: WORKER_URL
+          value: "http://agent-worker:8000"
+        - name: VENV_BUILDER_URL
+          value: "http://venv-builder:8001"
+        volumeMounts:
+        - name: tools-vol
+          mountPath: /tools
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8002
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8002
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: tools-vol
+        persistentVolumeClaim:
+          claimName: tools-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server
+spec:
+  selector:
+    app: mcp-server
+  ports:
+  - port: 8002
+    targetPort: 8002
+    nodePort: 30502
+  type: NodePort

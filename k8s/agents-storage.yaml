@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: agents-pv
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes:
+    - ReadWriteMany
+  storageClassName: local-agents
+  hostPath:
+    path: /tmp/agents
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agents-cache
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: local-agents
+  resources:
+    requests:
+      storage: 2Gi

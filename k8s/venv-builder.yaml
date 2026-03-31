@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: venv-builder
+  labels:
+    app: venv-builder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: venv-builder
+  template:
+    metadata:
+      labels:
+        app: venv-builder
+    spec:
+      containers:
+      - name: builder
+        image: venv-builder:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8001
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1"
+        env:
+        - name: VENV_BASE
+          value: "/venvs"
+        volumeMounts:
+        - name: venv-cache
+          mountPath: /venvs
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 3
+          periodSeconds: 5
+      volumes:
+      - name: venv-cache
+        persistentVolumeClaim:
+          claimName: venv-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: venv-builder
+spec:
+  selector:
+    app: venv-builder
+  ports:
+  - port: 8001
+    targetPort: 8001
+  type: ClusterIP

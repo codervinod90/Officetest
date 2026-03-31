@@ -14,6 +14,25 @@ spec:
       labels:
         app: agent-app
     spec:
+      initContainers:
+      - name: seed-agents
+        image: agent-app:latest
+        imagePullPolicy: Never
+        command: ["sh", "-c"]
+        args:
+        - |
+          set -e
+          mkdir -p /agents
+          for src in /app/artifacts/*/; do
+            [ -d "$src" ] || continue
+            name=$(basename "$src")
+            [ "$name" = "tools" ] && continue
+            mkdir -p "/agents/$name"
+            cp -rf "${src}/." "/agents/$name/"
+          done
+        volumeMounts:
+        - name: agents-vol
+          mountPath: /agents
       containers:
       - name: app
         image: agent-app:latest
@@ -25,11 +44,34 @@ spec:
             memory: "128Mi"
             cpu: "100m"
           limits:
-            memory: "256Mi"
-            cpu: "250m"
+            memory: "512Mi"
+            cpu: "500m"
+        envFrom:
+        - secretRef:
+            name: llm-api-keys
         env:
         - name: WORKER_URL
           value: "http://agent-worker:8000"
+        - name: VENV_BUILDER_URL
+          value: "http://venv-builder:8001"
+        - name: MCP_SERVER_URL
+          value: "http://mcp-server:8002"
+        - name: TOOLS_DIR
+          value: "/tools"
+        - name: ARTIFACTS_DIR
+          value: "/agents"
+        volumeMounts:
+        - name: tools-vol
+          mountPath: /tools
+        - name: agents-vol
+          mountPath: /agents
+      volumes:
+      - name: tools-vol
+        persistentVolumeClaim:
+          claimName: tools-cache
+      - name: agents-vol
+        persistentVolumeClaim:
+          claimName: agents-cache
 ---
 apiVersion: v1
 kind: Service

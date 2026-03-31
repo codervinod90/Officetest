@@ -1,0 +1,17 @@
+{
+  "name": "json_transformer",
+  "description": "Query and transform JSON data using JMESPath expressions. Supports filtering, projections, and nested access.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "data": {
+        "description": "JSON data (object or array) to query"
+      },
+      "expression": {
+        "type": "string",
+        "description": "JMESPath expression (e.g. 'people[?age > `30`].name', 'locations[0].city')"
+      }
+    },
+    "required": ["data", "expression"]
+  }
+}

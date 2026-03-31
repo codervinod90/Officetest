@@ -22,11 +22,11 @@ spec:
         - containerPort: 8000
         resources:
           requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
             memory: "512Mi"
             cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "2"
         readinessProbe:
           httpGet:
             path: /health
@@ -42,6 +42,21 @@ spec:
         env:
         - name: UVICORN_WORKERS
           value: "1"
+        - name: VENV_BASE
+          value: "/venvs"
+        - name: MCP_SERVER_URL
+          value: "http://mcp-server:8002"
+        envFrom:
+        - secretRef:
+            name: llm-api-keys
+        volumeMounts:
+        - name: venv-cache
+          mountPath: /venvs
+          readOnly: true
+      volumes:
+      - name: venv-cache
+        persistentVolumeClaim:
+          claimName: venv-cache
 ---
 apiVersion: v1
 kind: Service

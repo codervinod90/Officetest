@@ -1,0 +1,20 @@
+{
+  "name": "weather_lookup",
+  "description": "Look up current weather for a city. Returns temperature, condition, humidity, and wind speed.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "city": {
+        "type": "string",
+        "description": "City name (e.g. 'New York', 'London', 'Tokyo')"
+      },
+      "units": {
+        "type": "string",
+        "enum": ["celsius", "fahrenheit"],
+        "default": "celsius",
+        "description": "Temperature units"
+      }
+    },
+    "required": ["city"]
+  }
+}

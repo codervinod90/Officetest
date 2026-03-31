@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: tools-pv
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes:
+    - ReadWriteMany
+  storageClassName: local-tools
+  hostPath:
+    path: /tmp/tools
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tools-cache
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: local-tools
+  resources:
+    requests:
+      storage: 2Gi
