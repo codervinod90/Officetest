@@ -1,8 +1,9 @@
 """
 Venv Build Service (Option C: isolated per agent + shared pip cache)
 - Each agent gets its own venv at /venvs/<agent_id>/
-- pip downloads cached at /venvs/.pip-cache/ (shared across all builds)
-- Build, update, rebuild, list, delete operations
+- pip is invoked as `venv/bin/python -m pip` (not `bin/pip`) so bind mounts /
+  some PVCs that drop the execute bit on scripts still work (e.g. Docker Desktop Windows).
+- pip wheel cache: PIP_CACHE_DIR env (default /tmp/pip-cache) — container disk, not the PVC.
 """
 
 import json
@@ -22,7 +23,7 @@ logger = logging.getLogger("venv-builder")
 app = FastAPI(title="Venv Builder", version="2.0.0")
 
 VENV_BASE = os.getenv("VENV_BASE", "/venvs")
-PIP_CACHE = os.path.join(VENV_BASE, ".pip-cache")
+PIP_CACHE = os.getenv("PIP_CACHE_DIR", "/tmp/pip-cache").strip() or "/tmp/pip-cache"
 METADATA_FILE = "venv_meta.json"
 
 
@@ -53,10 +54,6 @@ def _python(agent_id: str) -> str:
     return os.path.join(_venv_dir(agent_id), "bin", "python")
 
 
-def _pip(agent_id: str) -> str:
-    return os.path.join(_venv_dir(agent_id), "bin", "pip")
-
-
 def _read_metadata(agent_id: str) -> dict:
     meta_path = os.path.join(_venv_dir(agent_id), METADATA_FILE)
     if os.path.exists(meta_path):
@@ -72,11 +69,14 @@ def _write_metadata(agent_id: str, meta: dict) -> None:
 
 
 def _get_installed_packages(agent_id: str) -> list[str]:
-    pip = _pip(agent_id)
-    if not os.path.exists(pip):
+    py = _python(agent_id)
+    if not os.path.exists(py):
         return []
     result = subprocess.run(
-        [pip, "freeze"], capture_output=True, text=True, timeout=30,
+        [py, "-m", "pip", "freeze"],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     return [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
 
@@ -97,9 +97,10 @@ def _create_venv(agent_id: str) -> str:
 
 
 def _pip_install(agent_id: str, args: list[str]) -> subprocess.CompletedProcess:
-    """Run pip install with shared cache."""
+    """Run pip via python -m pip (avoids executing bin/pip when +x is missing on the volume)."""
     _ensure_pip_cache()
-    cmd = [_pip(agent_id), "install", "--cache-dir", PIP_CACHE] + args
+    py = _python(agent_id)
+    cmd = [py, "-m", "pip", "install", "--cache-dir", PIP_CACHE] + args
     logger.info(f"pip install: agent={agent_id}, args={args}")
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 

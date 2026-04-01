@@ -167,7 +167,8 @@ pytest tests/e2e -v
 | `ModuleNotFoundError` (e.g. `httpx`) | `requirements.txt` present and non-empty for OpenAI agents; **venv-builder** `/build` vs cached venv; use **Rebuild venv**; worker image includes fallback deps for system Python in recent versions |
 | MCP tools missing | **tools-cache** and **mcp-server** init; restart **mcp-server** |
 | LLM errors in Generate | Secret **`llm-api-keys`** mounted on **agent-app**; correct `LLM_PROVIDER` and keys |
-| **venv-builder** HTTP **500** on `/build`, logs show **Permission denied** (pip/venv) | Common on **EFS/NFS** or **root-squash** storage. The manifest runs the builder as **UID 1000** with **`fsGroup: 1000`** so `/venvs` is writable. Rebuild the **venv-builder** image and restart the deployment. If an old PVC was populated as **root**, delete that agent’s folder under `/venvs` on the volume or recreate the **`venv-cache`** PVC once. |
+| **venv-builder** HTTP **500** on `/build`, logs show **Permission denied** on **`.../bin/pip`** | Often **Docker Desktop Windows** (or bind mounts) where **`bin/pip` isn’t executable**. The service uses **`python -m pip`** instead of calling **`pip`** directly, and puts the wheel cache under **`/tmp/pip-cache`** by default (override with env **`PIP_CACHE_DIR`**). Rebuild **venv-builder** after pulling this change. |
+| **venv-builder** **500**, **Permission denied** writing under **`/venvs`** | **EFS/NFS / root-squash**, **UID/fsGroup**, or an old PVC owned by **root**. Use **`fsGroup` / non-root** in `k8s/venv-builder.yaml`, or fix ownership / recreate **`venv-cache`**. |
 
 ---
 
