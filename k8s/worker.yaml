@@ -46,6 +46,10 @@ spec:
           value: "/venvs"
         - name: MCP_SERVER_URL
           value: "http://mcp-server:8002"
+        # Docker Desktop (Windows): PVC /venvs often breaks mmap on .so (pydantic_core).
+        # Copy venv to emptyDir before execute. Remove this var on Linux cloud if unused.
+        - name: WORKER_VENV_SCRATCH
+          value: "/venv-scratch"
         envFrom:
         - secretRef:
             name: llm-api-keys
@@ -53,10 +57,14 @@ spec:
         - name: venv-cache
           mountPath: /venvs
           readOnly: true
+        - name: venv-scratch
+          mountPath: /venv-scratch
       volumes:
       - name: venv-cache
         persistentVolumeClaim:
           claimName: venv-cache
+      - name: venv-scratch
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

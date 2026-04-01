@@ -4,12 +4,20 @@ Agent Worker Service
 - Uses cached venvs from /venvs/<agent_id>/ when available
 - Falls back to system Python only when requirements.txt is empty/missing
 - Stateless: temp dir per execution, auto-cleanup
+
+If WORKER_VENV_SCRATCH is set (e.g. /venv-scratch), the worker copies each venv from
+the PVC into that directory before running. Docker Desktop on Windows often serves
+/venvs in a way that breaks mmap() on .so files (pydantic_core, etc.); a normal
+emptyDir avoids that. Unset on clusters where /venvs already executes native libs.
 """
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import Dict, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
@@ -19,6 +27,52 @@ from pydantic import BaseModel
 app = FastAPI(title="Agent Worker", version="4.0.0")
 
 VENV_BASE = os.getenv("VENV_BASE", "/venvs")
+VENV_SCRATCH = os.getenv("WORKER_VENV_SCRATCH", "").strip()
+
+_materialize_master = threading.Lock()
+_materialize_locks: dict[str, threading.Lock] = {}
+
+
+def _agent_materialize_lock(agent_id: str) -> threading.Lock:
+    with _materialize_master:
+        if agent_id not in _materialize_locks:
+            _materialize_locks[agent_id] = threading.Lock()
+        return _materialize_locks[agent_id]
+
+
+def _venv_signature(src: str) -> str:
+    meta = os.path.join(src, "venv_meta.json")
+    if os.path.isfile(meta):
+        try:
+            with open(meta, encoding="utf-8") as f:
+                return str(json.load(f).get("built_at", ""))
+        except (OSError, json.JSONDecodeError):
+            pass
+    try:
+        return str(int(os.path.getmtime(src)))
+    except OSError:
+        return "0"
+
+
+def _materialize_venv_to_scratch(agent_id: str, scratch_root: str) -> str:
+    """Copy /venvs/<id> to scratch_root/<id> (symlinks=False so .so load from exec-friendly FS)."""
+    src = os.path.join(VENV_BASE, agent_id)
+    dst = os.path.join(scratch_root, agent_id)
+    sig = _venv_signature(src)
+    stamp = os.path.join(dst, ".materialize_sig")
+    py = os.path.join(dst, "bin", "python")
+    if os.path.isfile(stamp) and os.path.isfile(py):
+        try:
+            with open(stamp, encoding="utf-8") as f:
+                if f.read().strip() == sig:
+                    return py
+        except OSError:
+            pass
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, symlinks=False)
+    with open(stamp, "w", encoding="utf-8") as f:
+        f.write(sig)
+    return py
 
 
 class ExecuteResponse(BaseModel):
@@ -54,6 +108,16 @@ def _find_python(
     if agent_id:
         venv_python = os.path.join(VENV_BASE, agent_id, "bin", "python")
         if os.path.exists(venv_python):
+            if VENV_SCRATCH:
+                with _agent_materialize_lock(agent_id):
+                    try:
+                        venv_python = _materialize_venv_to_scratch(agent_id, VENV_SCRATCH)
+                    except OSError as e:
+                        return (
+                            "",
+                            None,
+                            f"WORKER_VENV_SCRATCH copy failed: {e}",
+                        )
             return venv_python, agent_id, None
     if require_venv:
         hint = os.path.join(VENV_BASE, agent_id or "<agent_id>", "bin", "python")

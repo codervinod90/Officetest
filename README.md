@@ -169,6 +169,7 @@ pytest tests/e2e -v
 | LLM errors in Generate | Secret **`llm-api-keys`** mounted on **agent-app**; correct `LLM_PROVIDER` and keys |
 | **venv-builder** HTTP **500** on `/build`, logs show **Permission denied** on **`.../bin/pip`** | Often **Docker Desktop Windows** (or bind mounts) where **`bin/pip` isn’t executable**. The service uses **`python -m pip`** instead of calling **`pip`** directly, and puts the wheel cache under **`/tmp/pip-cache`** by default (override with env **`PIP_CACHE_DIR`**). Rebuild **venv-builder** after pulling this change. |
 | **venv-builder** **500**, **Permission denied** writing under **`/venvs`** | **EFS/NFS / root-squash**, **UID/fsGroup**, or an old PVC owned by **root**. Use **`fsGroup` / non-root** in `k8s/venv-builder.yaml`, or fix ownership / recreate **`venv-cache`**. |
+| **`failed to map segment from shared object`** (`pydantic_core` `.so`) on **Docker Desktop Windows** | The node’s **`/venvs` mount** often can’t **mmap** native libs. **`agent-worker`** supports **`WORKER_VENV_SCRATCH=/venv-scratch`** plus an **`emptyDir`** mount (see `k8s/worker.yaml`): it **copies** the venv to scratch before running. On Linux cloud where `/venvs` is fine, remove **`WORKER_VENV_SCRATCH`** and the **`venv-scratch`** volume/mount to avoid the extra copy. |
 
 ---
 
