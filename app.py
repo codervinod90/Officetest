@@ -1,9 +1,7 @@
 """
-Agent Code Generator & Tester
-- Generate tab: LLM-only drafting of MCP tools and OpenAI+MCP agents (agent5 template)
-- New agents from `write_agent_bundle` always get a `requirements.txt` file (non-empty for OpenAI+MCP clones)
-- Test tab: run the selected agent on the worker; agents call MCP tools as the model decides
-- Tool call log: parses agent5 `[MCP trace]` footer to show whether tools ran for each test input
+Runtime LLM studio (Azure AI Foundry–compatible): generate MCP tool + agent code only via the LLM,
+write folders to disk, test in the UI. Agents always ship `requirements.txt`; only the agent runtime
+chooses which MCP tools to call (many tools may be registered). Venvs are prepared automatically on Test.
 """
 
 import json
@@ -39,21 +37,9 @@ def _main_py_needs_openai_venv(main_py: str) -> bool:
     )
 
 
-AGENT_DESCRIPTIONS = {
-    "agent1": "Text Processor – strips HTML, uppercase, reverse, stats",
-    "agent2": "Math Calculator – evaluates expressions, outputs YAML",
-    "agent3": "Data Transformer – CSV/key-value to JSON + table view",
-    "agent4": "Travel Reporter – calls MCP tools (weather + text analyzer)",
-    "agent5": "LLM Agent – GPT dynamically discovers and calls MCP tools",
-}
-
-SAMPLE_INPUTS = {
-    "agent1": "<h1>Hello</h1> <p>World from Agent Tester</p>",
-    "agent2": "(10 + 5) * 3 - 8",
-    "agent3": "name,age,city\nAlice,30,NYC\nBob,25,LA",
-    "agent4": "Tokyo",
-    "agent5": "What is the weather in Tokyo and Paris? Also analyze this text: Artificial intelligence is transforming how we build software.",
-}
+# Optional overrides when `meta.json` is missing (LLM-created agents use meta from disk).
+AGENT_DESCRIPTIONS: dict[str, str] = {}
+SAMPLE_INPUTS: dict[str, str] = {}
 
 
 def list_agents() -> list[str]:
@@ -81,12 +67,20 @@ def load_agent_meta(agent_id: str) -> dict:
 
 def agent_description(agent_id: str) -> str:
     meta = load_agent_meta(agent_id)
-    return meta.get("description") or AGENT_DESCRIPTIONS.get(agent_id, "")
+    return (
+        meta.get("description")
+        or AGENT_DESCRIPTIONS.get(agent_id)
+        or "LLM agent — chooses MCP tools at test time from user input"
+    )
 
 
 def agent_sample_input(agent_id: str) -> str:
     meta = load_agent_meta(agent_id)
-    return meta.get("sample_input") or SAMPLE_INPUTS.get(agent_id, "")
+    return (
+        meta.get("sample_input")
+        or SAMPLE_INPUTS.get(agent_id)
+        or "Ask a question; the agent decides which registered tools to call, if any."
+    )
 
 
 def list_mcp_tools() -> list[dict]:
@@ -143,15 +137,6 @@ def rebuild_venv(agent_id: str, requirements: str) -> dict:
         return {"error": str(e)}
 
 
-def list_cached_venvs() -> dict:
-    try:
-        resp = requests.get(f"{VENV_BUILDER_URL}/list", timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception:
-        return {"venvs": []}
-
-
 def execute_via_worker(
     code_files: dict,
     entry_point: str,
@@ -168,12 +153,14 @@ def execute_via_worker(
     if agent_id:
         payload["agent_id"] = agent_id
 
+    # Subprocess on worker may run up to `timeout` seconds; allow extra margin for HTTP read.
+    read_timeout = max(timeout + 90, 120)
     try:
         resp = requests.post(
             f"{WORKER_URL}/execute",
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=timeout + 10,
+            timeout=(10, read_timeout),
         )
         if resp.status_code >= 400:
             try:
@@ -185,9 +172,33 @@ def execute_via_worker(
         data = resp.json()
         return data.get("stdout", ""), data.get("stderr", ""), data.get("success", True), data.get("venv_used")
     except requests.exceptions.ConnectionError:
-        return "", f"Worker unreachable at {WORKER_URL}. Is the worker running?", False, None
+        hint = ""
+        wu = (WORKER_URL or "").lower()
+        if "agent-worker" in wu or ".svc." in wu:
+            hint = (
+                " **In-cluster DNS** (`agent-worker`, `*.svc.*`) only resolves **inside Kubernetes**. "
+                "If Streamlit runs on your laptop, set `WORKER_URL=http://127.0.0.1:8000` and run "
+                "`kubectl port-forward svc/agent-worker 8000:8000`. "
+                "If the UI runs in the **agent-app** pod, check `kubectl get pods -l app=agent-worker`."
+            )
+        hint += (
+            " If **short** prompts work but **tool-heavy** ones fail, the worker may be **restarting** "
+            "(e.g. OOM) mid-run—check `kubectl logs -l app=agent-worker` and `kubectl describe pod -l app=agent-worker`."
+        )
+        return (
+            "",
+            f"Worker unreachable at {WORKER_URL}. Is the worker running?{hint}",
+            False,
+            None,
+        )
     except requests.exceptions.Timeout:
-        return "", "Worker request timed out.", False, None
+        return (
+            "",
+            f"Worker HTTP client timed out (waited ~{read_timeout}s). Tool + LLM runs need more time—"
+            "timeouts were raised for OpenAI+MCP agents; if this persists, increase further in app.py / worker.",
+            False,
+            None,
+        )
     except requests.exceptions.RequestException as e:
         return "", str(e), False, None
 
@@ -239,6 +250,7 @@ def _strip_json_fences(text: str) -> str:
 
 
 def _llm_configured() -> bool:
+    """Azure OpenAI / Azure AI Foundry (OpenAI-compatible v1) or OpenAI.com."""
     prov = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
     if prov == "azure":
         return bool(os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"))
@@ -290,27 +302,37 @@ def _mcp_tools_context() -> str:
 
 def llm_draft_tool(user_idea: str, avoid_ids: list[str]) -> dict:
     taken = ", ".join(avoid_ids[:80]) if avoid_ids else "(none)"
-    system = f"""You are an expert Python engineer building MCP tools.
-The worker loads main.py and calls execute(params: dict) -> dict; return value must be JSON-serializable.
+    system = f"""You generate MCP tool code only (no agent logic). Tools are registered on the MCP server;
+LLM agents invoke them at test time based on user intent — there may be many tools; do not assume a single tool.
+
+The worker loads main.py and calls execute(params: dict) -> dict; return JSON-serializable dicts.
 Output ONLY valid JSON with keys:
 - tool_id: string, snake_case, starts with a letter, max 40 chars
-- description: string
-- inputSchema: JSON Schema with type "object", "properties", "required"
-- main_py: Python source defining def execute(params: dict) -> dict:
+- description: string (clear for an LLM that picks tools)
+- inputSchema: JSON Schema type "object" with "properties", "required"
+- main_py: full Python with def execute(params: dict) -> dict:
 - requirements_txt: pip lines or empty string if stdlib only
 
-Validate inputs, handle missing keys. No filesystem or subprocess unless essential and documented.
+Validate inputs, handle missing keys. Avoid filesystem/subprocess unless essential and documented.
 Do not use these tool_id values: {taken}."""
-    user = f"Tool idea:\n{user_idea}\n\nRegistered MCP tools (for context):\n{_mcp_tools_context()}"
+    user = f"Tool idea:\n{user_idea}\n\nAlready registered MCP tools (avoid duplicate behavior/names):\n{_mcp_tools_context()}"
     return llm_complete_json(system, user)
 
 
 def llm_draft_agent5_meta(user_idea: str, avoid_ids: list[str]) -> dict:
     taken = ", ".join(avoid_ids[:80]) if avoid_ids else "(none)"
     system = f"""Output ONLY valid JSON with string keys agent_id, description, sample_input.
+
+The runtime agent uses OpenAI-style tool calling against ALL MCP tools the server exposes; the model
+chooses zero, one, or many tools per user turn from natural language — never assume a fixed pipeline.
+
 agent_id: snake_case, unique, not in: {taken}
-Code will be copied from a fixed OpenAI function-calling + MCP template. You only supply metadata and a rich sample_input that exercises multiple MCP tools when possible."""
-    user = f"Agent purpose:\n{user_idea}\n\nTools:\n{_mcp_tools_context()}"
+description: one line for the UI sidebar
+sample_input: a realistic user message that could plausibly trigger DIFFERENT tools (or none if a pure
+  LLM answer fits), reflecting the user's goal below.
+
+You do not output main.py; a fixed template is copied after save. Every saved agent includes requirements.txt."""
+    user = f"Agent purpose / use case:\n{user_idea}\n\nMCP tools currently registered (model may use any subset):\n{_mcp_tools_context()}"
     return llm_complete_json(system, user)
 
 
@@ -347,9 +369,8 @@ def write_tool_from_llm_payload(data: dict, main_py_override: Optional[str] = No
     with open(os.path.join(base, "main.py"), "w") as f:
         f.write(main_py + ("\n" if not main_py.endswith("\n") else ""))
     req = (data.get("requirements_txt") or "").strip()
-    if req:
-        with open(os.path.join(base, "requirements.txt"), "w") as f:
-            f.write(req + "\n")
+    with open(os.path.join(base, "requirements.txt"), "w") as f:
+        f.write((req + "\n") if req else "")
     return tool_id
 
 
@@ -404,7 +425,8 @@ def write_openai_mcp_agent_clone(
 def _exec_timeout_for_agent_files(agent_files: dict[str, str]) -> int:
     req = agent_files.get("requirements.txt", "").lower()
     if "openai" in req or "httpx" in req:
-        return 120
+        # Several LLM rounds + MCP calls; 120s is often too tight.
+        return int(os.getenv("AGENT_EXECUTE_TIMEOUT_SEC", "300"))
     return 30
 
 
@@ -463,7 +485,7 @@ def execute_agent_test(
         return result
     timeout = _exec_timeout_for_agent_files(agent_files)
     if "LLM" in agent_description(agent_id):
-        timeout = max(timeout, 120)
+        timeout = max(timeout, int(os.getenv("AGENT_EXECUTE_TIMEOUT_SEC", "300")))
 
     def _run_worker() -> tuple[str, str, bool, Optional[str]]:
         return execute_via_worker(
@@ -563,22 +585,15 @@ def render_agent_test_result(
         st.error(result["stderr"])
     if not display_stdout and not result.get("stderr"):
         st.info("No output.")
-    cols = st.columns(2)
-    with cols[0]:
-        vu = result.get("venv_used")
-        vs2 = result.get("venv_status")
-        if vu:
-            st.caption(f"Venv: `{vu}` ({vs2 or 'ready'})")
-        else:
-            st.caption("Venv: none (using system Python)")
-    with cols[1]:
-        if vs2:
-            st.caption(f"Deps: {vs2}")
 
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Agent Tester", page_icon="🤖", layout="wide")
-st.title("🤖 Agent Code Tester")
+st.set_page_config(page_title="Agent Foundry Studio", page_icon="🤖", layout="wide")
+st.title("🤖 Agent Foundry — generate & test")
+st.caption(
+    "LLM-only code generation (tools + agents) · agents always include `requirements.txt` · "
+    "only agents call MCP tools intelligently at test time (multiple tools may be available)"
+)
 
 agents = list_agents()
 has_agents = len(agents) > 0
@@ -595,8 +610,6 @@ with st.sidebar:
         )
         agent_folder = os.path.join(ARTIFACTS_DIR, selected)
         agent_files = read_folder(agent_folder)
-        has_requirements = "requirements.txt" in agent_files
-        requirements_content = agent_files.get("requirements.txt", "").strip()
 
         st.divider()
         st.header("Code")
@@ -616,15 +629,9 @@ with st.sidebar:
                 "so bundled files never copied. Apply the updated `k8s/app.yaml` seed and run "
                 "`kubectl rollout restart deployment/agent-app`, or delete PVC `agents-cache` to re-seed."
             )
-        if has_requirements and requirements_content:
-            st.caption("Dependencies: `requirements.txt` found")
-        else:
-            st.caption("Dependencies: none (stdlib only)")
     else:
         selected = None
         agent_files = {}
-        has_requirements = False
-        requirements_content = ""
         st.info("No agents yet. Open the **Generate** tab to create one.")
         st.caption(f"Agents dir: `{ARTIFACTS_DIR}`")
         st.caption(f"Tools dir: `{TOOLS_DIR}`")
@@ -634,18 +641,19 @@ tab_gen, tab_test = st.tabs(["Generate", "Test"])
 
 # --- Generate Tab ---
 with tab_gen:
-    st.header("LLM generation")
+    st.header("Generate (LLM only)")
     st.caption(
-        f"Agents and MCP tools are created only via the LLM, then saved under **`{ARTIFACTS_DIR}`** and **`{TOOLS_DIR}`**. "
-        "After **Write to disk**, refresh the sidebar (**R**)."
+        f"Draft **tool** and **agent** `code_files` at runtime with your **Azure AI Foundry / Azure OpenAI** "
+        f"(or OpenAI) deployment, then **Write to disk** under **`{ARTIFACTS_DIR}`** and **`{TOOLS_DIR}`**. "
+        "Refresh the sidebar (**R**) after save."
     )
     st.info(
-        "**Test** runs the agent on the worker; the model decides when to call MCP tools. "
-        "The **Tool call log** shows whether tools ran for that input (agent5 `[MCP trace]`; set `AGENT_TOOL_TRACE=0` on the worker to hide it)."
+        "**Test** sends the agent to the worker with your input; the **model** selects which MCP tools to call "
+        "(if any) among all registered tools. **Tool call log** reads the `[MCP trace]` line from the agent template."
     )
     st.caption(
-        "LLM uses the same credentials as this app: `LLM_PROVIDER`, Azure or `OPENAI_API_KEY`. "
-        "On Kubernetes, mount Secret **llm-api-keys** on **agent-app** (`k8s/app.yaml`)."
+        "Configure **`LLM_PROVIDER`**, **`AZURE_OPENAI_*`** (Foundry/OpenAI-compatible endpoint ending in `/openai/v1/`), "
+        "or **`OPENAI_API_KEY`**. Kubernetes: Secret **`llm-api-keys`** on **agent-app** and **agent-worker**."
     )
 
     def _tool_ids_on_disk() -> list[str]:
@@ -659,21 +667,22 @@ with tab_gen:
 
     if not _llm_configured():
         st.warning(
-            "LLM is not configured. Set Azure or OpenAI variables locally, or ensure Secret **llm-api-keys** "
-            "exists and **agent-app** mounts it (see `k8s/app.yaml`)."
+            "LLM is not configured for code generation. Set **Azure AI Foundry / Azure OpenAI** "
+            "(`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`) or **OPENAI_API_KEY**, "
+            "or mount Secret **llm-api-keys** on **agent-app**."
         )
     else:
         lc1, lc2 = st.columns(2)
 
         with lc1:
-            st.markdown("**New tool (LLM)**")
+            st.markdown("**MCP tool (LLM)**")
             llm_tool_prompt = st.text_area(
-                "Describe what the tool should do",
+                "What should this tool do? (agents will call it when the model chooses)",
                 height=100,
                 key="llm_tool_prompt",
                 placeholder="e.g. Given text, return word count and the longest word",
             )
-            if st.button("Draft tool with LLM", key="btn_llm_tool_draft"):
+            if st.button("Generate tool code (LLM)", key="btn_llm_tool_draft"):
                 if not llm_tool_prompt.strip():
                     st.error("Enter a description first.")
                 else:
@@ -714,17 +723,18 @@ with tab_gen:
                         st.rerun()
 
         with lc2:
-            st.markdown("**New agent (LLM)**")
+            st.markdown("**Agent (LLM)**")
             st.caption(
-                "Uses the **agent5** template: OpenAI tool-calling + dynamic MCP. Worker needs LLM keys and `MCP_SERVER_URL`."
+                "Template: OpenAI tool-calling + MCP discovery. **`requirements.txt`** is always written. "
+                "Worker needs the same LLM env + `MCP_SERVER_URL`."
             )
             llm_agent_prompt = st.text_area(
-                "Describe what the agent should do",
+                "Agent use case (model will pick tools at test time from all MCP tools)",
                 height=100,
                 key="llm_agent_prompt",
-                placeholder="e.g. When the user asks about weather, call weather_lookup; summarize text with text_analyzer",
+                placeholder="e.g. Help users with weather, text analysis, and any other tools you register on MCP",
             )
-            if st.button("Draft agent with LLM", key="btn_llm_agent_draft"):
+            if st.button("Generate agent metadata (LLM)", key="btn_llm_agent_draft"):
                 if not llm_agent_prompt.strip():
                     st.error("Enter a description first.")
                 else:
@@ -791,9 +801,6 @@ with tab_test:
         st.header(f"Test: {selected}")
         st.caption(agent_description(selected))
 
-        if has_requirements and requirements_content:
-            st.info(f"This agent requires: `{requirements_content}` — venv will be built automatically.")
-
         user_input = st.text_area(
             "User Input",
             value=agent_sample_input(selected),
@@ -804,72 +811,6 @@ with tab_test:
         run_clicked = st.button("Run Test", type="primary", key="run_test_btn")
 
         if run_clicked:
-            with st.spinner("Ensuring venv (if needed) and running on worker..."):
+            with st.spinner("Running on worker..."):
                 test_result = execute_agent_test(selected, agent_files, user_input)
             render_agent_test_result(selected, test_result, requirement_input=user_input)
-
-        with st.expander("Advanced: venv & dependencies"):
-            if has_requirements:
-                st.subheader("requirements.txt (from agent code)")
-                st.code(agent_files["requirements.txt"], language="text")
-                st.caption("Venv is built automatically on **Run Test**.")
-            else:
-                st.info("This agent has no `requirements.txt` — it uses only stdlib.")
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.subheader("Manual venv")
-                build_btn = st.button("Build / Rebuild Venv", key="build_venv")
-                if build_btn:
-                    req_content = agent_files.get("requirements.txt", "")
-                    with st.spinner("Building venv..."):
-                        try:
-                            resp = requests.post(
-                                f"{VENV_BUILDER_URL}/rebuild",
-                                json={"agent_id": selected, "requirements": req_content},
-                                timeout=180,
-                            )
-                            resp.raise_for_status()
-                            result = resp.json()
-                            st.success(f"Venv rebuilt in {result['built_in_seconds']:.1f}s for `{selected}`")
-                            st.json(result)
-                        except Exception as e:
-                            st.error(str(e))
-
-            with col2:
-                st.subheader("Add packages")
-                new_packages = st.text_area(
-                    "Packages (one per line)",
-                    placeholder="pandas==2.1.0\nnumpy>=1.26",
-                    height=100,
-                    key="new_packages",
-                )
-                update_btn = st.button("Install Packages", key="update_packages")
-                if update_btn and new_packages.strip():
-                    pkgs = [p.strip() for p in new_packages.strip().splitlines() if p.strip()]
-                    with st.spinner(f"Installing {len(pkgs)} package(s)..."):
-                        try:
-                            resp = requests.post(
-                                f"{VENV_BUILDER_URL}/update",
-                                json={"agent_id": selected, "packages": pkgs, "upgrade": False},
-                                timeout=120,
-                            )
-                            resp.raise_for_status()
-                            result = resp.json()
-                            st.success(f"Installed: {', '.join(pkgs)}")
-                            st.json(result)
-                        except Exception as e:
-                            st.error(str(e))
-
-            st.divider()
-            st.subheader("All agent venvs")
-            if st.button("Refresh", key="list_venvs"):
-                venv_data = list_cached_venvs()
-                venvs = venv_data.get("venvs", [])
-                if venvs:
-                    for v in venvs:
-                        with st.expander(v["agent_id"]):
-                            st.json(v)
-                else:
-                    st.info("No venvs built yet. Run a test to auto-build.")

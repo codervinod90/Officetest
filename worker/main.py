@@ -126,7 +126,7 @@ def _find_python(
             None,
             (
                 f"requirements.txt is non-empty but no venv at {hint}. "
-                "Build via venv-builder /build or /rebuild, or the UI **Dependencies** tab."
+                "Build via venv-builder /build or /rebuild."
             ),
         )
     return sys.executable, None, None

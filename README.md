@@ -2,6 +2,8 @@
 
 Streamlit UI to **generate** agents and MCP tools (LLM-assisted), **run** agents on a worker with **per-agent virtualenvs**, and call **MCP** tools from the model at test time. Designed for local Kubernetes (e.g. Docker Desktop) with optional paths for full local processes or AWS EKS.
 
+**Where you test matters:** Development may happen on **macOS** while **QA runs on Windows** (Docker Desktop + WSL). Those are **different** clusters and node filesystems — issues like **venv `pip` / `.so` mmap** or **Secret drift** often appear only on Windows. After changing manifests, **apply and restart on the same machine you use for testing**, and treat **Mac “works here”** and **Windows “fails there”** as **two separate `kubectl` contexts**, not one shared environment.
+
 ---
 
 ## What runs where
@@ -113,8 +115,7 @@ Use the printed node IP and port (e.g. `30501` as in the sample manifest).
 ### 6. Use the UI
 
 1. **Generate** — Draft MCP tools and OpenAI+MCP agents with the LLM; **Write to disk** saves under the configured directories (`/agents` and `/tools` in the cluster).  
-2. **Test** — Select an agent, enter input, **Run Test**. The app calls **venv-builder** to ensure a venv exists, then **worker** runs the agent. **Tool call log** summarizes MCP usage when the agent emits the agent5 `[MCP trace]` line.  
-3. **Advanced** — Venv rebuild and extra packages live under the Test tab expander.
+2. **Test** — Select an agent, enter input, **Run Test**. The app calls **venv-builder** automatically when `requirements.txt` is present, then the **worker** runs the agent. **Tool call log** summarizes MCP usage when the agent emits the agent5 `[MCP trace]` line. (No separate Dependencies / venv management UI for now.)
 
 After changing **application code** in the image, rebuild **`agent-app`** and restart:
 
