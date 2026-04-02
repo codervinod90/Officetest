@@ -19,6 +19,43 @@ from openai import OpenAI
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://mcp-server:8002").rstrip("/")
 MAX_TOOL_ROUNDS = 5
 
+# Used when system_prompt.txt is missing or empty (same text as app.py DEFAULT_AGENT5_SYSTEM_PROMPT).
+DEFAULT_BUILTIN_SYSTEM_PROMPT = (
+    "You are a helpful assistant.\n"
+    "For general knowledge, chit-chat, or anything you can answer without external tools, "
+    "reply in natural language and do not call tools.\n"
+    "When the user needs data or actions that only the listed tools provide (e.g. live weather, "
+    "structured analysis), call the right tool(s). Prefer one assistant turn with multiple "
+    "parallel tool calls when lookups are independent.\n"
+    "After tool results, summarize clearly for the user."
+)
+
+
+def _system_prompt_base() -> str:
+    """Editable per-agent instructions from system_prompt.txt next to this module (sent as code_files)."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(root, "system_prompt.txt")
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read().strip()
+            if text:
+                return text
+        except OSError:
+            pass
+    return DEFAULT_BUILTIN_SYSTEM_PROMPT
+
+
+def _build_system_message(tool_names: list[str], mcp_err: str | None) -> str:
+    parts = [_system_prompt_base()]
+    if tool_names:
+        parts.append(f"Available tools: {', '.join(tool_names)}.")
+    if mcp_err:
+        parts.append(
+            f"MCP server was unreachable ({mcp_err}). Answer from general knowledge only; no tools can be run."
+        )
+    return "\n".join(parts)
+
 
 def _tool_trace_enabled() -> bool:
     """Append [MCP trace] footer to stdout so you can see if MCP tools ran."""
@@ -129,24 +166,8 @@ def run(user_input: str) -> str:
         tool_names = [t["name"] for t in mcp_tools]
         openai_tools = mcp_tools_to_openai_functions(mcp_tools) if mcp_tools else []
 
-        sys_lines = [
-            "You are a helpful assistant.",
-            "For general knowledge, chit-chat, or anything you can answer without external tools, "
-            "reply in natural language and do not call tools.",
-            "When the user needs data or actions that only the listed tools provide (e.g. live weather, "
-            "structured analysis), call the right tool(s). Prefer one assistant turn with multiple "
-            "parallel tool calls when lookups are independent.",
-            "After tool results, summarize clearly for the user.",
-        ]
-        if tool_names:
-            sys_lines.append(f"Available tools: {', '.join(tool_names)}.")
-        if mcp_err:
-            sys_lines.append(
-                f"MCP server was unreachable ({mcp_err}). Answer from general knowledge only; no tools can be run."
-            )
-
         messages = [
-            {"role": "system", "content": "\n".join(sys_lines)},
+            {"role": "system", "content": _build_system_message(tool_names, mcp_err)},
             {"role": "user", "content": user_input},
         ]
 

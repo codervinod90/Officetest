@@ -1,6 +1,7 @@
 """
 Runtime LLM studio (Azure AI Foundry–compatible): generate MCP tool + agent code only via the LLM,
-write folders to disk, test in the UI. Agents always ship `requirements.txt`; only the agent runtime
+write folders to disk, test in the UI. OpenAI+MCP agents use `system_prompt.txt` (editable in **Test**)
+plus the agent5 template `main.py`. Agents always ship `requirements.txt`; only the agent runtime
 chooses which MCP tools to call (many tools may be registered). Venvs are prepared automatically on Test.
 """
 
@@ -25,6 +26,25 @@ TOOLS_DIR = os.getenv("TOOLS_DIR", _default_tools)
 
 # agent5-style agents need a worker venv; system Python on the worker image has no httpx/openai.
 DEFAULT_OPENAI_MCP_REQUIREMENTS = "openai>=1.0\nhttpx>=0.27.0\n"
+
+# Keep in sync with artifacts/agent5/main.py DEFAULT_BUILTIN_SYSTEM_PROMPT.
+DEFAULT_AGENT5_SYSTEM_PROMPT = (
+    "You are a helpful assistant.\n"
+    "For general knowledge, chit-chat, or anything you can answer without external tools, "
+    "reply in natural language and do not call tools.\n"
+    "When the user needs data or actions that only the listed tools provide (e.g. live weather, "
+    "structured analysis), call the right tool(s). Prefer one assistant turn with multiple "
+    "parallel tool calls when lookups are independent.\n"
+    "After tool results, summarize clearly for the user."
+)
+
+
+def _agent_uses_openai_mcp_stack(agent_files: dict[str, str]) -> bool:
+    main = agent_files.get("main.py", "")
+    if "discover_tools" in main and "MCP_SERVER_URL" in main:
+        return True
+    req = (agent_files.get("requirements.txt") or "").lower()
+    return "openai" in req and "httpx" in req
 
 
 def _main_py_needs_openai_venv(main_py: str) -> bool:
@@ -321,7 +341,7 @@ Do not use these tool_id values: {taken}."""
 
 def llm_draft_agent5_meta(user_idea: str, avoid_ids: list[str]) -> dict:
     taken = ", ".join(avoid_ids[:80]) if avoid_ids else "(none)"
-    system = f"""Output ONLY valid JSON with string keys agent_id, description, sample_input.
+    system = f"""Output ONLY valid JSON with string keys agent_id, description, sample_input, system_prompt.
 
 The runtime agent uses OpenAI-style tool calling against ALL MCP tools the server exposes; the model
 chooses zero, one, or many tools per user turn from natural language — never assume a fixed pipeline.
@@ -330,8 +350,11 @@ agent_id: snake_case, unique, not in: {taken}
 description: one line for the UI sidebar
 sample_input: a realistic user message that could plausibly trigger DIFFERENT tools (or none if a pure
   LLM answer fits), reflecting the user's goal below.
+system_prompt: multi-line string — the main model instructions (role, tone, when to call tools vs answer
+  from general knowledge). Do NOT enumerate MCP tool names (the runtime appends the live tool list).
 
-You do not output main.py; a fixed template is copied after save. Every saved agent includes requirements.txt."""
+You do not output main.py; a fixed template is copied after save. Every saved agent includes requirements.txt
+and system_prompt.txt."""
     user = f"Agent purpose / use case:\n{user_idea}\n\nMCP tools currently registered (model may use any subset):\n{_mcp_tools_context()}"
     return llm_complete_json(system, user)
 
@@ -380,6 +403,7 @@ def write_agent_bundle(
     sample_input: str,
     main_py: str,
     requirements_txt: str = "",
+    system_prompt: Optional[str] = None,
 ) -> None:
     aid = agent_id.strip().lower()
     if not _valid_slug(aid):
@@ -406,6 +430,10 @@ def write_agent_bundle(
     # Every agent folder always has requirements.txt (possibly empty = stdlib-only on worker).
     with open(os.path.join(base, "requirements.txt"), "w") as f:
         f.write(req_out + ("\n" if req_out else ""))
+    if system_prompt is not None:
+        sp = (system_prompt or "").strip() or DEFAULT_AGENT5_SYSTEM_PROMPT
+        with open(os.path.join(base, "system_prompt.txt"), "w", encoding="utf-8") as f:
+            f.write(sp + "\n")
 
 
 def write_openai_mcp_agent_clone(
@@ -413,13 +441,22 @@ def write_openai_mcp_agent_clone(
     description: str,
     sample_input: str,
     requirements_override: str = "",
+    system_prompt: str = "",
 ) -> None:
     main_py = _load_from_agent5("main.py")
     if not main_py:
         raise RuntimeError("agent5 template not found (expected agent5/main.py under ARTIFACTS_DIR or ./artifacts).")
     raw_req = _load_from_agent5("requirements.txt")
     req = (requirements_override or "").strip() or (raw_req or "").strip() or DEFAULT_OPENAI_MCP_REQUIREMENTS
-    write_agent_bundle(agent_id.strip().lower(), description, sample_input, main_py, req)
+    sp = (system_prompt or "").strip() or DEFAULT_AGENT5_SYSTEM_PROMPT
+    write_agent_bundle(
+        agent_id.strip().lower(),
+        description,
+        sample_input,
+        main_py,
+        req,
+        system_prompt=sp,
+    )
 
 
 def _exec_timeout_for_agent_files(agent_files: dict[str, str]) -> int:
@@ -750,9 +787,17 @@ with tab_gen:
 
             ap = st.session_state.get("llm_agent_payload")
             if ap:
-                st.json(ap)
-                st.caption("Runtime **main.py** is copied from **agent5** after you save.")
+                st.json({k: v for k, v in ap.items() if k != "system_prompt"})
                 aid_preview = (ap.get("agent_id") or "").strip().lower()
+                sp_key_draft = f"llm_agent_system_prompt_{aid_preview or 'draft'}"
+                draft_sp_default = (ap.get("system_prompt") or "").strip() or DEFAULT_AGENT5_SYSTEM_PROMPT
+                st.text_area(
+                    "System prompt (saved as `system_prompt.txt`; tweak in **Test** until results look good)",
+                    value=draft_sp_default,
+                    height=200,
+                    key=sp_key_draft,
+                )
+                st.caption("Runtime **main.py** is copied from **agent5** after you save.")
                 e2e_inp = st.text_input(
                     "E2E test input (defaults to sample_input)",
                     value=ap.get("sample_input") or "",
@@ -762,10 +807,12 @@ with tab_gen:
                 with ac1:
                     if st.button("Write agent to disk", type="primary", key="btn_llm_agent_write"):
                         try:
+                            sp_live = (st.session_state.get(sp_key_draft) or draft_sp_default).strip()
                             write_openai_mcp_agent_clone(
                                 ap.get("agent_id", ""),
                                 ap.get("description", ""),
                                 ap.get("sample_input", ""),
+                                system_prompt=sp_live,
                             )
                             st.success(f"Created `{ARTIFACTS_DIR}/{aid_preview}/`. Open **Test** or run **E2E** below.")
                             st.session_state["llm_agent_last_id"] = aid_preview
@@ -786,6 +833,13 @@ with tab_gen:
                     else:
                         folder = os.path.join(ARTIFACTS_DIR, aid_preview)
                         files = read_folder(folder)
+                        sp_key_draft = f"llm_agent_system_prompt_{aid_preview or 'draft'}"
+                        if sp_key_draft in st.session_state:
+                            sp_e2e = (st.session_state[sp_key_draft] or "").strip()
+                            files = {
+                                **files,
+                                "system_prompt.txt": sp_e2e or DEFAULT_AGENT5_SYSTEM_PROMPT,
+                            }
                         with st.spinner(f"Running {aid_preview} on worker (MCP from pod)..."):
                             er = execute_agent_test(aid_preview, files, e2e_inp.strip())
                         st.markdown("**E2E result**")
@@ -801,8 +855,44 @@ with tab_test:
         st.header(f"Test: {selected}")
         st.caption(agent_description(selected))
 
+        files_for_test = dict(agent_files)
+        openai_mcp_agent = _agent_uses_openai_mcp_stack(agent_files)
+
+        if openai_mcp_agent:
+            default_sp = (
+                agent_files.get("system_prompt.txt", "").strip() or DEFAULT_AGENT5_SYSTEM_PROMPT
+            )
+            sp_key = f"test_sys_prompt_{selected}"
+            st.subheader("System prompt")
+            st.caption(
+                "Edit and **Run Test** as often as you like — no **Docker image rebuild** or app redeploy is required. "
+                "Each run sends this text as `system_prompt.txt` with the agent. Use **Save** only when you want "
+                "the prompt persisted on the agents volume."
+            )
+            st.text_area(
+                "Model instructions (sent as `system_prompt.txt` on each run; tool names are appended at runtime)",
+                value=default_sp,
+                height=220,
+                key=sp_key,
+                help="Iterate: adjust prompt → Run Test → save to disk when satisfied.",
+            )
+            if st.button("Save system prompt to disk", key="btn_save_system_prompt"):
+                text = (st.session_state.get(sp_key) or default_sp).strip()
+                p = os.path.join(ARTIFACTS_DIR, selected, "system_prompt.txt")
+                try:
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.write(text + "\n")
+                    st.success(f"Wrote `{p}`")
+                    st.rerun()
+                except OSError as e:
+                    st.error(str(e))
+            files_for_test["system_prompt.txt"] = (
+                st.session_state.get(sp_key) or default_sp
+            ).strip() or DEFAULT_AGENT5_SYSTEM_PROMPT
+            st.divider()
+
         user_input = st.text_area(
-            "User Input",
+            "User input",
             value=agent_sample_input(selected),
             height=120,
             key="test_user_input",
@@ -812,5 +902,5 @@ with tab_test:
 
         if run_clicked:
             with st.spinner("Running on worker..."):
-                test_result = execute_agent_test(selected, agent_files, user_input)
+                test_result = execute_agent_test(selected, files_for_test, user_input)
             render_agent_test_result(selected, test_result, requirement_input=user_input)
